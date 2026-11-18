@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if running %}<meta http-equiv="refresh" content="2">{% endif %}
+  <title>值班台 · 三副本单对象</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>值班台 · 三副本单对象</h1>
+    <p class="sub">单对象网页存储：三个独立目录保存副本，按版本摘要交付与修复。</p>
+  </div>
+  <nav class="links">
+    <a href="/">刷新</a>
+    <a href="/api/status">状态 JSON</a>
+    <a href="/download">下载当前版本</a>
+  </nav>
+</header>
+
+<main>
+  {% if notice %}
+  <div class="notice notice-{{ notice_level }}">{{ notice }}</div>
+  {% endif %}
+
+  <section class="card">
+    <h2>当前对象</h2>
+    {% if version %}
+      <dl class="facts">
+        <div><dt>版本</dt><dd>#{{ version.seq }} <span class="mono small">{{ version.id }}</span></dd></div>
+        <div><dt>文件名</dt><dd>{{ version.filename }}</dd></div>
+        <div><dt>长度</dt><dd>{{ version.size }} 字节</dd></div>
+        <div><dt>登记 SHA-256</dt><dd class="mono">{{ version.digest }}</dd></div>
+        <div><dt>登记时间</dt><dd>{{ version.created_at }}</dd></div>
+        <div>
+          <dt>可读副本</dt>
+          <dd>
+            <strong>{{ verified_count }}/3</strong>
+            {% if unrecoverable %}
+              <span class="badge badge-bad">不可恢复</span>
+            {% elif verified_count < 3 %}
+              <span class="badge badge-warn">降级可读</span>
+            {% else %}
+              <span class="badge badge-good">三副本健康</span>
+            {% endif %}
+          </dd>
+        </div>
+      </dl>
+
+      {% if unrecoverable %}
+      <div class="alert alert-bad">
+        三个副本均未通过版本 #{{ version.seq }} 的 SHA-256 校验，当前不可恢复。
+        下载会被拒绝；请重新上传正确文件（会产生新版本）。
+      </div>
+      {% endif %}
+
+      <div class="actions">
+        <a class="button" href="/download?version_id={{ version.id }}">下载版本 #{{ version.seq }}</a>
+        <form method="post" action="/inspect" class="inline">
+          <input type="hidden" name="version_id" value="{{ version.id }}">
+          <button type="submit" {% if running %}disabled{% endif %}>
+            {% if running %}巡检执行中……{% else %}巡检并修复{% endif %}
+          </button>
+        </form>
+      </div>
+      {% if running %}
+      <div class="progress">
+        <span class="spinner"></span>
+        巡检 #{{ running.id }}（版本 #{{ running.version_seq }}）进行中：{{ running.progress or "准备中" }}
+        <a href="/">刷新状态</a>
+      </div>
+      {% endif %}
+
+      <table class="replicas">
+        <thead>
+          <tr><th>副本</th><th>目录/路径</th><th>状态</th><th>实测大小</th><th>实测 SHA-256</th><th>说明</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+        {% for check in checks %}
+          <tr class="state-{{ check.state }}">
+            <td><strong>{{ check.slot }}</strong></td>
+            <td class="mono small">{{ check.relative_path or "未登记" }}</td>
+            <td><span class="state-pill state-{{ check.state }}">{{ state_labels.get(check.state, check.state) }}</span></td>
+            <td>{{ check.observed_size if check.observed_size is not none else "—" }}</td>
+            <td class="mono small">{{ check.observed_digest or "—" }}</td>
+            <td class="small">{{ check.note or "" }}</td>
+            <td>
+              <form method="post" action="/replicas/{{ check.slot }}/corrupt" class="inline"
+                    onsubmit="return confirm('确认把版本 #{{ version.seq }} 的副本 {{ check.slot }} 破坏为损坏数据？');">
+                <input type="hidden" name="version_id" value="{{ version.id }}">
+                <button class="danger" type="submit">模拟损坏</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">尚未上传对象。上传后会在 <code>replica-1</code>、<code>replica-2</code>、<code>replica-3</code> 三个独立目录写入相同字节，并登记版本摘要。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>上传 / 替换</h2>
+    <p class="muted">上限 1 MiB（{{ max_bytes }} 字节）。替换会生成新版本；旧巡检结果不会覆盖新版本。</p>
+    <form method="post" action="/upload" enctype="multipart/form-data" class="upload">
+      <input type="file" name="file" required>
+      <button type="submit">上传并登记新版本</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>巡检记录</h2>
+    {% if inspections %}
+    <table>
+      <thead>
+        <tr><th>#</th><th>版本</th><th>状态</th><th>开始</th><th>结束</th><th>修复数</th><th>摘要</th></tr>
+      </thead>
+      <tbody>
+      {% for item in inspections %}
+        <tr>
+          <td>{{ item.id }}</td>
+          <td>#{{ item.version_seq }}</td>
+          <td><span class="state-pill state-{{ item.state }}">{{ item.state }}</span></td>
+          <td class="small">{{ item.started_at }}</td>
+          <td class="small">{{ item.finished_at or "—" }}</td>
+          <td>{{ item.repaired_count }}</td>
+          <td class="small">{{ item.summary or item.progress or "" }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无巡检记录。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>版本登记</h2>
+    {% if versions %}
+    <table>
+      <thead><tr><th>版本</th><th>状态</th><th>文件</th><th>大小</th><th>SHA-256</th><th>登记时间</th></tr></thead>
+      <tbody>
+      {% for item in versions %}
+        <tr>
+          <td>#{{ item.seq }}</td>
+          <td>{{ "当前" if item.status == "current" else "已被替换" }}</td>
+          <td>{{ item.filename }}</td>
+          <td>{{ item.size }}</td>
+          <td class="mono small">{{ item.digest }}</td>
+          <td class="small">{{ item.created_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无版本。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>操作日志</h2>
+    {% if events %}
+    <table>
+      <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>内容</th></tr></thead>
+      <tbody>
+      {% for event in events %}
+        <tr class="level-{{ event.level }}">
+          <td class="small">{{ event.at }}</td>
+          <td>{{ event.level }}</td>
+          <td class="small">{{ event.kind }}</td>
+          <td class="small">{{ event.message }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无日志。</p>
+    {% endif %}
+  </section>
+</main>
+<footer class="foot">页面状态按磁盘实际副本实时计算；不信任数据库缓存状态。</footer>
+</body>
+</html>

@@ -1,0 +1,15 @@
+services:
+  storage-desk:
+    build: .
+    image: replica-desk:local
+    container_name: replica-desk
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - object-data:/data
+    restart: unless-stopped
+
+volumes:
+  object-data:
