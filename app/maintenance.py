@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
-from .storage import ObjectStorage, RepairSourceInvalid, ReplicaCheck
+from .storage import ObjectStorage, QuotaExceeded, RepairSourceInvalid, ReplicaCheck, StorageError
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ def run_inspection(
 
         repaired = 0
         verified_slots = set(initial_verified)
+        blocked: str | None = None
         for check in checks:
             if check.state == "verified":
                 continue
@@ -79,9 +80,17 @@ def run_inspection(
                 except RepairSourceInvalid as exc:
                     logger.warning("repair source %s invalid: %s", source_slot, exc)
                     continue
-                outcome = storage.commit_repair(
-                    version.id, check.slot, staged_path, source_slot, digest
-                )
+                except (QuotaExceeded, StorageError) as exc:
+                    # 容量上限或写盘失败：不能报修复成功，原可读副本保持原样。
+                    blocked = str(exc)
+                    break
+                try:
+                    outcome = storage.commit_repair(
+                        version.id, check.slot, staged_path, source_slot, digest
+                    )
+                except StorageError as exc:
+                    blocked = str(exc)
+                    break
                 if outcome == "committed":
                     repaired += 1
                     verified_slots.add(check.slot)
@@ -89,6 +98,8 @@ def run_inspection(
                     break
                 if outcome == "stale":
                     break
+            if blocked is not None:
+                raise StorageError(blocked)
             if not committed:
                 break
 

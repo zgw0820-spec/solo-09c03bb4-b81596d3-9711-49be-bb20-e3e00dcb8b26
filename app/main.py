@@ -38,6 +38,17 @@ REPLICA_STATE_LABELS = {
 }
 
 
+def _human_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
 class _BodyTooLarge(Exception):
     pass
 
@@ -132,6 +143,7 @@ def create_app(
 ) -> FastAPI:
     storage = ObjectStorage(data_dir or os.environ.get("DATA_DIR", "/data"))
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+    templates.env.filters["human_bytes"] = _human_bytes
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -157,6 +169,7 @@ def create_app(
         checks = storage.check_replicas(version) if version else []
         verified = sum(1 for check in checks if check.state == "verified")
         running = storage.running_inspection()
+        quota_report = storage.quota_report()
         ctx: dict[str, Any] = {
             "request": request,
             "version": version,
@@ -172,6 +185,8 @@ def create_app(
             "notice_level": level,
             "max_bytes": MAX_OBJECT_BYTES,
             "now": utc_now(),
+            "quota_report": quota_report,
+            "quota_blocked": [item for item in quota_report if item.full],
         }
         return templates.TemplateResponse(request, "index.html", ctx)
 
@@ -260,6 +275,41 @@ def create_app(
             )
         return _redirect_notice(f"已发起巡检 #{inspection.id}。", "info")
 
+    @app.post("/quotas")
+    async def set_quota(request: Request):
+        form = await request.form()
+        try:
+            slot_raw = form.get("slot")
+            quota_raw = form.get("quota_bytes")
+            try:
+                slot = int(str(slot_raw or "").strip())
+            except (TypeError, ValueError):
+                return _redirect_notice("副本编号必须为 1、2 或 3。", "error")
+            try:
+                quota_bytes = int(str(quota_raw or "").strip())
+            except (TypeError, ValueError):
+                return _redirect_notice("容量上限必须是正整数（字节）。", "error")
+            await run_in_threadpool(storage.set_quota, slot, quota_bytes)
+        except (StorageError, InvalidUpload) as exc:
+            return _redirect_notice(str(exc), "error")
+        finally:
+            await form.close()
+        return _redirect_notice(
+            f"已把副本 {slot} 目录的容量上限调整为 {quota_bytes} 字节。", "success"
+        )
+
+    @app.post("/maintenance/cleanup")
+    async def cleanup_temporaries(request: Request):
+        form = await request.form()
+        try:
+            await form.close()
+            removed = await run_in_threadpool(storage.cleanup_temporaries)
+        except StorageError as exc:
+            return _redirect_notice(str(exc), "error")
+        if removed:
+            return _redirect_notice(f"已清理 {removed} 个暂存/残留文件，空间已释放，可重试写入。", "success")
+        return _redirect_notice("没有发现需要清理的暂存/残留文件。", "info")
+
     @app.get("/download")
     def download(version_id: str | None = None):
         version, data, slot = storage.read_current_verified(version_id)
@@ -315,6 +365,7 @@ def create_app(
                     if latest
                     else None
                 ),
+                "quotas": [item.as_dict() for item in storage.quota_report()],
             }
         )
 

@@ -7,6 +7,11 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # 三个副本目录的默认容量上限（字节）。不设置时默认每个目录 32 MiB；
+      # 也可在网页“副本目录容量”卡片里随时调整，设置会落库并在重启后保留。
+      # REPLICA_QUOTA_BYTES: "33554432"
+      # 单独覆盖某个副本目录（槽位 1/2/3），优先级高于统一值：
+      # REPLICA_2_QUOTA_BYTES: "16777216"
     volumes:
       - object-data:/data
     restart: unless-stopped

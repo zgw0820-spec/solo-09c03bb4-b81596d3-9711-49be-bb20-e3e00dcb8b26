@@ -180,3 +180,29 @@ tr.level-warning td { color: var(--warn); }
   font-size: 12px;
   padding: 0 20px 30px;
 }
+
+.quota-bar {
+  display: inline-block;
+  width: 120px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+.quota-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+tr.state-missing .quota-bar span { background: var(--bad); }
+tr.state-partial .quota-bar span { background: var(--warn); }
+input[type=number] {
+  font: inherit;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+}

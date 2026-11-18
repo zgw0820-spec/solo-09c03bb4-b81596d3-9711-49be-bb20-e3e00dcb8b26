@@ -103,6 +103,65 @@
   </section>
 
   <section class="card">
+    <h2>副本目录容量</h2>
+    <p class="muted">
+      每个副本目录独立设容量上限。实际占用按磁盘实时扫描，包含正式副本、新版本写入暂存、
+      巡检修复暂存和未清理残留；在途写入另有预留，上传与巡检修复交错时不会重复使用同一块空闲空间。
+    </p>
+    {% if quota_blocked %}
+    <div class="alert alert-bad">
+      空间不足：以下目录已被阻塞 ——
+      {% for item in quota_blocked %}
+        <strong>{{ item.directory }}</strong>（占用 {{ item.used_bytes | human_bytes }} / 上限 {{ item.quota_bytes | human_bytes }}
+        {%- if item.reserved_bytes %}，在途预留 {{ item.reserved_bytes | human_bytes }}{% endif %}）{% if not loop.last %}；{% endif %}
+      {% endfor %}
+      。请清理残留文件或调高容量上限后重试；本次失败不会删除仍应保留的旧版本。
+    </div>
+    {% endif %}
+    <table class="replicas">
+      <thead>
+        <tr><th>副本目录</th><th>实际占用</th><th>在途预留</th><th>可用空间</th><th>容量上限</th><th>使用率</th><th>状态</th><th>调整上限</th></tr>
+      </thead>
+      <tbody>
+      {% for item in quota_report %}
+        <tr class="{% if item.full %}state-missing{% elif item.used_bytes + item.reserved_bytes >= item.quota_bytes * 0.9 %}state-partial{% else %}state-verified{% endif %}">
+          <td><strong>{{ item.directory }}</strong></td>
+          <td>{{ item.used_bytes | human_bytes }} <span class="mono small">({{ item.used_bytes }} B)</span></td>
+          <td>{{ item.reserved_bytes | human_bytes }}</td>
+          <td>{{ item.available_bytes | human_bytes }}</td>
+          <td>{{ item.quota_bytes | human_bytes }} <span class="mono small">({{ item.quota_bytes }} B)</span></td>
+          <td>
+            {% set pct = (item.used_bytes + item.reserved_bytes) * 100 // item.quota_bytes %}
+            <div class="quota-bar"><span style="width: {{ [pct, 100] | min }}%"></span></div>
+            <span class="small">{{ pct }}%</span>
+          </td>
+          <td>
+            {% if item.full %}
+              <span class="state-pill state-missing">已阻塞</span>
+            {% elif pct >= 90 %}
+              <span class="state-pill state-partial">接近上限</span>
+            {% else %}
+              <span class="state-pill state-verified">正常</span>
+            {% endif %}
+          </td>
+          <td>
+            <form method="post" action="/quotas" class="upload">
+              <input type="hidden" name="slot" value="{{ item.slot }}">
+              <input type="number" name="quota_bytes" min="1" step="1" value="{{ item.quota_bytes }}" required style="width: 11em;">
+              <button type="submit">更新上限</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <form method="post" action="/maintenance/cleanup" class="upload" style="margin-top: 12px;"
+          onsubmit="return confirm('清理三个副本目录里的 .tmp-* 暂存/残留文件？巡检执行中会被拒绝。');">
+      <button type="submit" class="danger">清理暂存与残留文件并释放空间</button>
+    </form>
+  </section>
+
+  <section class="card">
     <h2>上传 / 替换</h2>
     <p class="muted">上限 1 MiB（{{ max_bytes }} 字节）。替换会生成新版本；旧巡检结果不会覆盖新版本。</p>
     <form method="post" action="/upload" enctype="multipart/form-data" class="upload">

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sqlite3
@@ -15,10 +16,38 @@ MAX_OBJECT_BYTES = 1024 * 1024
 REPLICA_SLOTS = (1, 2, 3)
 RETAINED_VERSION_REPLICAS = 10
 _HASH_CHUNK = 256 * 1024
+# 每个副本目录的默认容量上限（字节）。可用环境变量 REPLICA_QUOTA_BYTES 或
+# REPLICA_<槽位>_QUOTA_BYTES 覆盖，也可在网页上随时调整并落库。
+DEFAULT_REPLICA_QUOTA_BYTES = 32 * 1024 * 1024
+QUOTA_SETTING_PREFIX = "quota_replica_"
 
 
 class StorageError(RuntimeError):
     """存储层可预期的业务错误。"""
+
+
+class QuotaExceeded(StorageError):
+    """某个副本目录的容量上限会被本次写入突破。"""
+
+    def __init__(
+        self,
+        slot: int,
+        quota: int,
+        used: int,
+        reserved: int,
+        needed: int,
+    ) -> None:
+        self.slot = slot
+        self.quota = quota
+        self.used = used
+        self.reserved = reserved
+        self.needed = needed
+        super().__init__(
+            f"副本目录 replica-{slot} 空间不足，本次写入被阻塞：容量上限 {quota} 字节，"
+            f"目录实际占用 {used} 字节，在途写入已预留 {reserved} 字节，"
+            f"本次还需 {needed} 字节，合计将达 {used + reserved + needed} 字节。"
+            "请清理残留临时文件或调高该目录容量上限后重试。"
+        )
 
 
 class ObjectNotFound(StorageError):
@@ -120,6 +149,25 @@ class Inspection:
         )
 
 
+@dataclass(frozen=True)
+class SlotQuota:
+    slot: int
+    directory: str
+    quota_bytes: int
+    used_bytes: int
+    reserved_bytes: int
+    available_bytes: int
+
+    @property
+    def full(self) -> bool:
+        return self.used_bytes + self.reserved_bytes >= self.quota_bytes
+
+    def as_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["full"] = self.full
+        return data
+
+
 def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -148,6 +196,13 @@ class ObjectStorage:
         }
         self._write_lock = threading.RLock()
         self._active_inspections: set[int] = set()
+        # 在途空间预留账本：上传与巡检修复交错时，同一块空闲空间只能被一个
+        # 写入者预留，避免两边都按“当前磁盘占用”判断而重复使用。
+        self._reserve_lock = threading.RLock()
+        self._reserved_bytes: dict[int, int] = {slot: 0 for slot in REPLICA_SLOTS}
+        self._quotas: dict[int, int] = {
+            slot: DEFAULT_REPLICA_QUOTA_BYTES for slot in REPLICA_SLOTS
+        }
 
     # ------------------------------------------------------------------ setup
     def init(self) -> None:
@@ -161,6 +216,7 @@ class ObjectStorage:
             conn.execute(
                 "INSERT OR IGNORE INTO objects(id, current_version_id) VALUES (1, NULL)"
             )
+            self._init_quotas(conn)
             now = utc_now()
             stale = conn.execute(
                 "SELECT id, version_seq FROM inspections WHERE state = 'running'"
@@ -268,11 +324,79 @@ class ObjectStorage:
                 inspection_id  INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                key    TEXT PRIMARY KEY,
+                value  TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS ix_inspections_started
                 ON inspections(started_at DESC);
             CREATE INDEX IF NOT EXISTS ix_events_at ON events(at DESC);
             """
         )
+
+    def _default_quota(self, slot: int) -> int:
+        """读取环境变量里的默认配额：REPLICA_<槽位>_QUOTA_BYTES 优先于统一值。"""
+        raw = os.environ.get(f"REPLICA_{slot}_QUOTA_BYTES")
+        if raw is None:
+            raw = os.environ.get("REPLICA_QUOTA_BYTES")
+        try:
+            value = int((raw or "").strip())
+        except ValueError:
+            value = DEFAULT_REPLICA_QUOTA_BYTES
+        return value if value > 0 else DEFAULT_REPLICA_QUOTA_BYTES
+
+    def _init_quotas(self, conn: sqlite3.Connection) -> None:
+        """配额落库优先；首次启动时用环境变量默认值初始化并持久化。"""
+        for slot in REPLICA_SLOTS:
+            key = f"{QUOTA_SETTING_PREFIX}{slot}"
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                value = self._default_quota(slot)
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?, ?)",
+                    (key, str(value)),
+                )
+            else:
+                try:
+                    value = int(row["value"])
+                except ValueError:
+                    value = self._default_quota(slot)
+                if value <= 0:
+                    value = self._default_quota(slot)
+            self._quotas[slot] = value
+
+    def get_quotas(self) -> dict[int, int]:
+        with self._reserve_lock:
+            return dict(self._quotas)
+
+    def set_quota(self, slot: int, quota_bytes: int) -> None:
+        """调整某个副本目录的容量上限并落库；不移动或删除任何现有文件。"""
+        if slot not in REPLICA_SLOTS:
+            raise StorageError("副本编号必须为 1、2 或 3。")
+        if not isinstance(quota_bytes, int) or quota_bytes <= 0:
+            raise InvalidUpload("容量上限必须是正整数（字节）。")
+        with self._reserve_lock:
+            self._quotas[slot] = quota_bytes
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (f"{QUOTA_SETTING_PREFIX}{slot}", str(quota_bytes)),
+            )
+            used = self._directory_usage(slot)
+            reserved = self._reserved_bytes[slot]
+            self._log(
+                conn,
+                "info",
+                "quota_changed",
+                f"副本 {slot} 目录容量上限调整为 {quota_bytes} 字节"
+                f"（当前实际占用 {used} 字节，在途预留 {reserved} 字节）。",
+            )
 
     def _cleanup_temporaries(self) -> None:
         for path in list(self.replica_dirs.values()):
@@ -294,6 +418,97 @@ class ObjectStorage:
             self._log_standalone(
                 "warning", "cleanup", f"清理了 {removed} 个未登记版本的中断上传残留文件。"
             )
+
+    # ------------------------------------------------------------------ quotas
+    def _directory_usage(self, slot: int) -> int:
+        """目录实际占用：正式副本、写入暂存、修复暂存和未清理残留全部计入。
+
+        只统计本目录内的普通文件（不跟随符号链接），每次都按磁盘实际重新扫描。
+        """
+        directory = self.replica_dirs[slot]
+        total = 0
+        if not directory.exists():
+            return 0
+        for path in directory.iterdir():
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                total += path.stat().st_size
+            except OSError:
+                # 文件可能正被替换/删除：跳过本次统计，下一轮再核算。
+                continue
+        return total
+
+    @contextmanager
+    def _reserve_space(self, slot: int, needed: int) -> Iterator[None]:
+        """在途空间预留：账本计入后才允许写临时文件，写完（或失败）立即释放。
+
+        上传与巡检修复共用同一本账，交错执行时同一块空闲空间不会被重复使用。
+        """
+        with self._reserve_lock:
+            quota = self._quotas[slot]
+            used = self._directory_usage(slot)
+            reserved = self._reserved_bytes[slot]
+            if used + reserved + needed > quota:
+                raise QuotaExceeded(slot, quota, used, reserved, needed)
+            self._reserved_bytes[slot] = reserved + needed
+        try:
+            yield
+        finally:
+            with self._reserve_lock:
+                self._reserved_bytes[slot] -= needed
+                if self._reserved_bytes[slot] < 0:
+                    self._reserved_bytes[slot] = 0
+
+    def quota_report(self) -> list[SlotQuota]:
+        """返回三个副本目录的实时容量账：实际占用 + 在途预留 + 上限。"""
+        report: list[SlotQuota] = []
+        with self._reserve_lock:
+            for slot in REPLICA_SLOTS:
+                used = self._directory_usage(slot)
+                reserved = self._reserved_bytes[slot]
+                quota = self._quotas[slot]
+                available = max(0, quota - used - reserved)
+                report.append(
+                    SlotQuota(
+                        slot=slot,
+                        directory=self.replica_dirs[slot].relative_to(self.data_dir).as_posix(),
+                        quota_bytes=quota,
+                        used_bytes=used,
+                        reserved_bytes=reserved,
+                        available_bytes=available,
+                    )
+                )
+        return report
+
+    def blocked_slots(self, needed: int) -> list[SlotQuota]:
+        """指出哪些副本目录会被一次需要 needed 字节的写入阻塞。"""
+        return [
+            item
+            for item in self.quota_report()
+            if item.used_bytes + item.reserved_bytes + needed > item.quota_bytes
+        ]
+
+    def cleanup_temporaries(self) -> int:
+        """值班员手动清理三个目录里的暂存/残留文件（巡检未运行时才允许）。"""
+        with self._write_lock:
+            if self._active_inspections:
+                raise InspectionBusy("有巡检正在执行，不能清理正在使用的暂存文件。")
+            removed = 0
+            for directory in self.replica_dirs.values():
+                for path in directory.glob(".tmp-*"):
+                    try:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError:
+                        continue
+            if removed:
+                self._log_standalone(
+                    "info",
+                    "cleanup",
+                    f"手动清理了 {removed} 个暂存/残留文件，目录空间已释放，可重试写入。",
+                )
+            return removed
 
     # -------------------------------------------------------------- file paths
     def _abs_path(self, relative_path: str) -> Path:
@@ -509,6 +724,7 @@ class ObjectStorage:
         digest = _hash_bytes(data)
         version_id = uuid.uuid4().hex
         created_at = utc_now()
+        needed = len(data)
 
         with self._write_lock:
             current = self.current_version()
@@ -524,20 +740,26 @@ class ObjectStorage:
                 created_at=created_at,
                 status="current",
             )
+            # 先给三个目录分别预留本次写入空间：任一个目录容量不足都会在写盘前
+            # 整体拒绝，绝不触碰仍应保留的旧版本副本。
             written: list[Path] = []
-            try:
+            with contextlib.ExitStack() as stack:
+                for slot in REPLICA_SLOTS:
+                    stack.enter_context(self._reserve_space(slot, needed))
                 for slot in REPLICA_SLOTS:
                     rel = self._relative_replica_path(version_id, slot)
                     path = self._abs_path(rel)
-                    self._atomic_write(path, data)
+                    try:
+                        self._atomic_write(path, data)
+                    except OSError as exc:
+                        raise StorageError(
+                            f"副本 {slot} 写盘失败（{exc}），已放弃本次替换，"
+                            "原版本副本保持不变。"
+                        ) from exc
                     written.append(path)
                     observed, observed_size = _hash_file(path)
                     if observed != digest or observed_size != len(data):
                         raise StorageError(f"副本 {slot} 写入后校验失败。")
-            except BaseException:
-                for path in written:
-                    path.unlink(missing_ok=True)
-                raise
 
             try:
                 with self._db() as conn:
@@ -672,7 +894,13 @@ class ObjectStorage:
                 tampered = b"corrupted-missing-replica\n"
             except OSError as exc:
                 raise StorageError(f"读取副本失败：{exc}") from exc
-            self._atomic_write(path, tampered)
+            with self._reserve_space(slot, len(tampered)):
+                try:
+                    self._atomic_write(path, tampered)
+                except OSError as exc:
+                    raise StorageError(
+                        f"副本 {slot} 写盘失败（{exc}），模拟损坏未完成。"
+                    ) from exc
             with self._db() as conn:
                 conn.execute(
                     """
@@ -894,7 +1122,11 @@ class ObjectStorage:
         source_slot: int,
         target_slot: int,
     ) -> tuple[Path, str]:
-        """从已验真副本读取字节，写入目标副本目录内的临时文件并再次校验。"""
+        """从已验真副本读取字节，写入目标副本目录内的临时文件并再次校验。
+
+        暂存文件与正式副本同目录，写入前先在配额账本预留空间，因此巡检修复
+        与上传交错时不会重复使用同一块空闲空间。
+        """
         result = self.read_verified_replica(version, source_slot)
         if result is None:
             raise RepairSourceInvalid(f"副本 {source_slot} 未能通过当前版本摘要校验，不能作为修复源。")
@@ -906,10 +1138,16 @@ class ObjectStorage:
         target = self._abs_path(target_row["relative_path"])
         temp = target.parent / f".tmp-repair-{version.id}-{target_slot}-{uuid.uuid4().hex}"
         try:
-            with temp.open("xb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+            with self._reserve_space(target_slot, len(data)):
+                try:
+                    with temp.open("xb") as handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError as exc:
+                    raise StorageError(
+                        f"副本 {target_slot} 修复暂存写盘失败（{exc}），本次修复未完成。"
+                    ) from exc
             observed, observed_size = _hash_file(temp)
             if observed != version.digest or observed_size != version.size:
                 raise RepairSourceInvalid("修复临时文件摘要校验失败。")
@@ -958,7 +1196,12 @@ class ObjectStorage:
                 # 提交前最后一次确认当前版本指针未变化，避免把旧字节盖到新版本上。
                 if not self.is_current(version_id):
                     return "stale"
-                os.replace(staged_path, target)
+                try:
+                    os.replace(staged_path, target)
+                except OSError as exc:
+                    raise StorageError(
+                        f"副本 {target_slot} 修复提交写盘失败（{exc}），本次修复未完成。"
+                    ) from exc
                 try:
                     dir_fd = os.open(target.parent, os.O_RDONLY)
                     try:
